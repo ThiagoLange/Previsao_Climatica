@@ -11,10 +11,12 @@ and the only thing that differs is where `tp_ultima_obs` comes from and how stal
 """
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 
 from . import config
 from .climatology import climatology_for_months
+from .external_data import oni_features
 
 
 def _prev_month(month: xr.DataArray) -> xr.DataArray:
@@ -65,6 +67,11 @@ def build_features(
     target_ym = target_month + 12 * base["time"].dt.year
     last_obs_ym = last_obs_month + 12 * tp_ultima_obs_time.dt.year
     feat["lag_meses"] = target_ym - last_obs_ym
+
+    obs_actual_time = base["time"].to_index() - pd.DateOffset(months=1)
+    oni, oni_available = oni_features(obs_actual_time)
+    feat["oni"] = xr.DataArray(oni, dims="time", coords={"time": base["time"]})
+    feat["oni_available"] = xr.DataArray(oni_available, dims="time", coords={"time": base["time"]})
 
     return feat
 
