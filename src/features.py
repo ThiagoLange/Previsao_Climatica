@@ -21,6 +21,13 @@ def _prev_month(month: xr.DataArray) -> xr.DataArray:
     return ((month - 2) % 12) + 1
 
 
+def _neighbor_mean(da: xr.DataArray, window: int = 5) -> xr.DataArray:
+    """Spatial smoothing over a window x window box (0.25deg grid, so window=5 ~= 1.25deg),
+    giving the model regional context (Andes/Amazonia correlation) it otherwise lacks when
+    every grid point is featurized independently."""
+    return da.rolling(lat=window, lon=window, center=True, min_periods=1).mean()
+
+
 def build_features(
     base: xr.Dataset,
     tp_ultima_obs: xr.DataArray,
@@ -48,10 +55,12 @@ def build_features(
     for name in config.ATMOS_VARS:
         feat[name] = base[name]
         feat[f"{name}_anom"] = base[name] - climatology_for_months(clim_atmos[name], obs_month)
+        feat[f"{name}_nbr5"] = _neighbor_mean(base[name])
 
     feat["tp_ultima_obs"] = tp_ultima_obs
     clima_last_obs = climatology_for_months(clim_tp, last_obs_month)
     feat["tp_ultima_obs_anom"] = tp_ultima_obs - clima_last_obs
+    feat["tp_ultima_obs_nbr5"] = _neighbor_mean(tp_ultima_obs)
 
     target_ym = target_month + 12 * base["time"].dt.year
     last_obs_ym = last_obs_month + 12 * tp_ultima_obs_time.dt.year
