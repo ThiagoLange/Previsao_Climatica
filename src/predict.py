@@ -36,7 +36,12 @@ def predict(split: str, model_path=None, alpha: float = BLEND_ALPHA) -> pd.DataF
     booster = xgb.Booster()
     booster.load_model(str(model_path))
 
-    X = df.drop(columns=[c for c in NON_FEATURE_COLS if c in df.columns])
+    cols_path = config.MODELS_DIR / f"feature_cols_{split}.json"
+    if cols_path.exists():
+        feature_cols = json.loads(cols_path.read_text())
+        X = df[feature_cols]
+    else:
+        X = df.drop(columns=[c for c in NON_FEATURE_COLS if c in df.columns])
     model_pred = booster.predict(xgb.DMatrix(X))
 
     alpha_path = config.MODELS_DIR / "blend_alpha_by_lag.json"

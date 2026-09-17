@@ -61,11 +61,17 @@ class ParquetBatchIter(xgb.DataIter):
         return 1
 
 
-def load_xy(path) -> tuple[pd.DataFrame, "pd.Series", pd.DataFrame]:
-    """Small parquet (val/test, ~24 months) -> load fully in memory, unlike the train split."""
+def load_xy(path, feature_cols: list[str] | None = None) -> tuple[pd.DataFrame, "pd.Series", pd.DataFrame]:
+    """Small parquet (val/test, ~24 months) -> load fully in memory, unlike the train split.
+    feature_cols forces an exact column order (see train()) instead of trusting that this
+    parquet's schema happens to match the training parquet's -- xarray doesn't guarantee
+    consistent data_var ordering across differently-built Datasets."""
     df = pd.read_parquet(path)
     y = df[TARGET]
-    X = df.drop(columns=[c for c in NON_FEATURE_COLS if c in df.columns])
+    if feature_cols is not None:
+        X = df[feature_cols]
+    else:
+        X = df.drop(columns=[c for c in NON_FEATURE_COLS if c in df.columns])
     return X, y, df
 
 
@@ -160,6 +166,9 @@ def train(
     train_path = config.PROCESSED_DIR / f"features_train_{split}.parquet"
     feature_cols = _feature_cols(train_path)
 
+    cols_path = config.MODELS_DIR / f"feature_cols_{split}.json"
+    cols_path.write_text(json.dumps(feature_cols))
+
     it = ParquetBatchIter(train_path, feature_cols, TARGET)
     dtrain = xgb.QuantileDMatrix(it, max_bin=max_bin)
 
@@ -182,7 +191,7 @@ def train(
     t0 = time.time()
     if split == "holdout":
         val_path = config.PROCESSED_DIR / "features_val_holdout.parquet"
-        X_val, y_val, df_val = load_xy(val_path)
+        X_val, y_val, df_val = load_xy(val_path, feature_cols)
         dval = xgb.QuantileDMatrix(X_val, label=y_val, ref=dtrain, max_bin=max_bin)
 
         booster = xgb.train(
