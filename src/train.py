@@ -26,7 +26,7 @@ from sklearn.metrics import root_mean_squared_error
 from . import config
 
 TARGET = "tp_alvo_true"
-NON_FEATURE_COLS = {"time", "id", TARGET}
+NON_FEATURE_COLS = {"time", "id", "time_origem", TARGET}
 
 
 def _feature_cols(path) -> list[str]:
