@@ -17,6 +17,7 @@ of `pd.read_parquet` + `XGBRegressor.fit`.
 import argparse
 import time
 
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import xgboost as xgb
@@ -84,6 +85,29 @@ def report_holdout(df_val: pd.DataFrame, y_val: pd.Series, pred_val) -> float:
     return overall
 
 
+def search_blend_alpha(df_val: pd.DataFrame, y_val: pd.Series, pred_val) -> float:
+    """Scans pred_final = alpha*model + (1-alpha)*climatology on the holdout, since the
+    model roughly ties climatology overall but loses in low-variance months -- a convex
+    blend can keep the model's gains where it wins without its noise where it doesn't."""
+    y = y_val.values
+    clima = df_val["clima_alvo"].values
+
+    rmse_model = root_mean_squared_error(y, pred_val)
+    rmse_clima = root_mean_squared_error(y, clima)
+    print(f"[blend] alpha=1.00 (modelo puro)      RMSE = {rmse_model:.4f}")
+    print(f"[blend] alpha=0.00 (climatologia pura) RMSE = {rmse_clima:.4f}")
+
+    best_alpha, best_rmse = 1.0, rmse_model
+    for alpha in np.arange(0.05, 1.0, 0.05):
+        blended = alpha * pred_val + (1 - alpha) * clima
+        rmse = root_mean_squared_error(y, blended)
+        if rmse < best_rmse:
+            best_alpha, best_rmse = alpha, rmse
+
+    print(f"[blend] melhor alpha={best_alpha:.2f} RMSE = {best_rmse:.4f}")
+    return best_alpha
+
+
 def train(
     split: str,
     device: str,
@@ -132,6 +156,7 @@ def train(
         pred_val = booster.predict(dval, iteration_range=(0, booster.best_iteration + 1))
         report_holdout(df_val, y_val, pred_val)
         print(f"[holdout] best_iteration={booster.best_iteration}")
+        search_blend_alpha(df_val, y_val, pred_val)
     else:
         booster = xgb.train(params, dtrain, num_boost_round=n_estimators)
 
