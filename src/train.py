@@ -84,7 +84,16 @@ def report_holdout(df_val: pd.DataFrame, y_val: pd.Series, pred_val) -> float:
     return overall
 
 
-def train(split: str, device: str, n_estimators: int, learning_rate: float) -> None:
+def train(
+    split: str,
+    device: str,
+    n_estimators: int,
+    learning_rate: float,
+    max_depth: int = 5,
+    min_child_weight: float = 5.0,
+    reg_lambda: float = 5.0,
+    reg_alpha: float = 0.5,
+) -> None:
     train_path = config.PROCESSED_DIR / f"features_train_{split}.parquet"
     feature_cols = _feature_cols(train_path)
 
@@ -95,7 +104,10 @@ def train(split: str, device: str, n_estimators: int, learning_rate: float) -> N
         objective="reg:squarederror",
         eval_metric="rmse",
         eta=learning_rate,
-        max_depth=8,
+        max_depth=max_depth,
+        min_child_weight=min_child_weight,
+        reg_lambda=reg_lambda,
+        reg_alpha=reg_alpha,
         subsample=0.8,
         colsample_bytree=0.8,
         tree_method="hist",
@@ -136,9 +148,22 @@ def main() -> None:
     ap.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     ap.add_argument("--n-estimators", type=int, default=1000)
     ap.add_argument("--learning-rate", type=float, default=0.05)
+    ap.add_argument("--max-depth", type=int, default=5)
+    ap.add_argument("--min-child-weight", type=float, default=5.0)
+    ap.add_argument("--reg-lambda", type=float, default=5.0)
+    ap.add_argument("--reg-alpha", type=float, default=0.5)
     args = ap.parse_args()
 
-    train(args.split, args.device, args.n_estimators, args.learning_rate)
+    train(
+        args.split,
+        args.device,
+        args.n_estimators,
+        args.learning_rate,
+        max_depth=args.max_depth,
+        min_child_weight=args.min_child_weight,
+        reg_lambda=args.reg_lambda,
+        reg_alpha=args.reg_alpha,
+    )
 
 
 if __name__ == "__main__":
