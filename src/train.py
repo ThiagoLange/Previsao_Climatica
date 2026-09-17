@@ -15,6 +15,7 @@ of `pd.read_parquet` + `XGBRegressor.fit`.
 """
 
 import argparse
+import json
 import time
 
 import numpy as np
@@ -108,6 +109,43 @@ def search_blend_alpha(df_val: pd.DataFrame, y_val: pd.Series, pred_val) -> floa
     return best_alpha
 
 
+def search_blend_alpha_by_lag(df_val: pd.DataFrame, y_val: pd.Series, pred_val, default_alpha: float) -> dict[int, float]:
+    """Per-lag alpha instead of one global value: low lag (more atmospheric signal) and
+    high lag (degrades toward pure climatology) likely want different blend weights."""
+    y = y_val.values
+    clima = df_val["clima_alvo"].values
+    lag = df_val["lag_meses"].astype(int).values
+
+    alphas: dict[int, float] = {}
+    print("[blend] alpha por lag:")
+    for l in sorted(set(lag)):
+        mask = lag == l
+        y_l, pred_l, clima_l = y[mask], pred_val[mask], clima[mask]
+
+        best_alpha, best_rmse = 1.0, root_mean_squared_error(y_l, pred_l)
+        for alpha in np.arange(0.0, 1.01, 0.05):
+            blended = alpha * pred_l + (1 - alpha) * clima_l
+            rmse = root_mean_squared_error(y_l, blended)
+            if rmse < best_rmse:
+                best_alpha, best_rmse = alpha, rmse
+
+        alphas[int(l)] = round(float(best_alpha), 2)
+        print(f"  lag={l:02d} alpha={best_alpha:.2f} RMSE={best_rmse:.4f}")
+
+    blended_all = apply_lag_alpha(df_val, pred_val, alphas, default_alpha)
+    rmse_all = root_mean_squared_error(y, blended_all)
+    print(f"[blend] alpha por lag (aplicado geral) RMSE = {rmse_all:.4f}")
+
+    return alphas
+
+
+def apply_lag_alpha(df: pd.DataFrame, model_pred, alphas_by_lag: dict[int, float], default_alpha: float):
+    lag = df["lag_meses"].astype(int).values
+    alpha_arr = np.array([alphas_by_lag.get(int(l), default_alpha) for l in lag])
+    clima = df["clima_alvo"].values
+    return alpha_arr * model_pred + (1 - alpha_arr) * clima
+
+
 def train(
     split: str,
     device: str,
@@ -156,7 +194,12 @@ def train(
         pred_val = booster.predict(dval, iteration_range=(0, booster.best_iteration + 1))
         report_holdout(df_val, y_val, pred_val)
         print(f"[holdout] best_iteration={booster.best_iteration}")
-        search_blend_alpha(df_val, y_val, pred_val)
+        global_alpha = search_blend_alpha(df_val, y_val, pred_val)
+        alphas_by_lag = search_blend_alpha_by_lag(df_val, y_val, pred_val, global_alpha)
+
+        alpha_path = config.MODELS_DIR / "blend_alpha_by_lag.json"
+        alpha_path.write_text(json.dumps({"default": global_alpha, "by_lag": alphas_by_lag}, indent=2))
+        print(f"wrote {alpha_path}")
     else:
         booster = xgb.train(params, dtrain, num_boost_round=n_estimators)
 

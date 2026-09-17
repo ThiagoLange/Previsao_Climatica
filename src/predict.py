@@ -6,20 +6,24 @@ Requires `processed/features_test.parquet` (from `build_dataset --split full`) a
 a trained booster at `models/xgb_<split>.json` (from `train.py`).
 
 Blends the model prediction with the `clima_alvo` climatology feature already present
-in the parquet: `pred = alpha*model + (1-alpha)*clima_alvo`. alpha=0.45 was tuned on
-the holdout split (train<=2020, val=2021-2022), where it beat both the pure model
-(RMSE 1.9095) and pure climatology (1.8938) with RMSE 1.8733. The real test set has no
-labels to retune alpha against, so this value is carried over as-is.
+in the parquet: `pred = alpha*model + (1-alpha)*clima_alvo`. Uses a per-lag_meses alpha
+from `models/blend_alpha_by_lag.json` (written by `train.py --split holdout`) when
+available, since low lag (more atmospheric signal) and high lag (degrades toward pure
+climatology) want different blend weights. Falls back to a single --alpha (default
+0.45, the holdout-tuned global value: RMSE 1.8733 vs 1.9095 pure model / 1.8938 pure
+climatology) when the file is missing. The real test set has no labels to retune
+against, so whatever was tuned on the holdout is carried over as-is.
 """
 
 import argparse
+import json
 
 import pandas as pd
 import xgboost as xgb
 
 from . import config
 from .make_submission import build_submission
-from .train import NON_FEATURE_COLS
+from .train import NON_FEATURE_COLS, apply_lag_alpha
 
 BLEND_ALPHA = 0.45
 
@@ -34,7 +38,17 @@ def predict(split: str, model_path=None, alpha: float = BLEND_ALPHA) -> pd.DataF
 
     X = df.drop(columns=[c for c in NON_FEATURE_COLS if c in df.columns])
     model_pred = booster.predict(xgb.DMatrix(X))
-    blended = alpha * model_pred + (1 - alpha) * df["clima_alvo"].values
+
+    alpha_path = config.MODELS_DIR / "blend_alpha_by_lag.json"
+    if alpha_path.exists():
+        alpha_config = json.loads(alpha_path.read_text())
+        alphas_by_lag = {int(k): v for k, v in alpha_config["by_lag"].items()}
+        blended = apply_lag_alpha(df, model_pred, alphas_by_lag, alpha_config["default"])
+        print(f"blend: usando alpha por lag de {alpha_path}")
+    else:
+        blended = alpha * model_pred + (1 - alpha) * df["clima_alvo"].values
+        print(f"blend: {alpha_path} nao encontrado, usando alpha global={alpha}")
+
     return pd.DataFrame({"id": df["id"], "tp_mm_day": blended})
 
 
@@ -42,7 +56,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", choices=["holdout", "full"], default="full")
     ap.add_argument("--model", help="override model path (default models/xgb_<split>.json)")
-    ap.add_argument("--alpha", type=float, default=BLEND_ALPHA, help="weight on model pred vs climatology")
+    ap.add_argument("--alpha", type=float, default=BLEND_ALPHA, help="fallback global weight on model pred vs climatology")
     ap.add_argument("--output", required=True)
     args = ap.parse_args()
 
