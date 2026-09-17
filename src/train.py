@@ -1,27 +1,19 @@
-"""CLI: trains a LightGBM regressor on the parquet features from build_dataset.
+"""CLI: trains an XGBoost regressor on the parquet features from build_dataset.
 
-    uv run python -m src.train --split holdout                    # CPU, train<=2020-12, val=2021-2022
-    uv run python -m src.train --split holdout --device cuda       # GPU, needs a CUDA-enabled LightGBM build
+    uv run python -m src.train --split holdout                 # CPU
+    uv run python -m src.train --split holdout --device cuda    # GPU, pip-installed xgboost already ships CUDA support
     uv run python -m src.train --split full --device cuda --n-estimators 2000
 
-GPU (--device gpu|cuda) requires a LightGBM binary built with GPU support; the
-default `pip install lightgbm` / `uv sync` wheel is CPU-only. On the GPU
-machine, rebuild it before using --device:
-
-    pip uninstall -y lightgbm
-    pip install lightgbm --config-settings=cmake.define.USE_CUDA=ON   # --device cuda, needs CUDA toolkit
-    # or, for the OpenCL backend instead:
-    pip install lightgbm --config-settings=cmake.define.USE_GPU=ON    # --device gpu, needs OpenCL + Boost
-
-With a plain CPU wheel, --device cuda/gpu fails at fit() with a "GPU Tree
-Learner was not enabled" error — fall back to --device cpu.
+--device cuda needs an NVIDIA GPU + driver visible to WSL/Linux (check `nvidia-smi`).
+No special build required: the standard `pip install xgboost` / `uv sync` wheel
+bundles CUDA support, unlike LightGBM which needs a from-source GPU build.
 """
 
 import argparse
 import time
 
-import lightgbm as lgb
 import pandas as pd
+import xgboost as xgb
 from sklearn.metrics import root_mean_squared_error
 
 from . import config
@@ -44,44 +36,39 @@ def train(split: str, device: str, n_estimators: int, learning_rate: float) -> N
     params = dict(
         n_estimators=n_estimators,
         learning_rate=learning_rate,
-        num_leaves=63,
+        max_depth=8,
         subsample=0.8,
         colsample_bytree=0.8,
+        tree_method="hist",
+        device=device,
         random_state=42,
+        eval_metric="rmse",
     )
-    if device != "cpu":
-        params["device_type"] = device  # "gpu" (OpenCL) or "cuda"
-
-    model = lgb.LGBMRegressor(**params)
 
     t0 = time.time()
     if split == "holdout":
         val_path = config.PROCESSED_DIR / "features_val_holdout.parquet"
         X_val, y_val, _ = load_xy(val_path)
-        model.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_val, y_val)],
-            eval_metric="rmse",
-            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(50)],
-        )
+        model = xgb.XGBRegressor(**params, early_stopping_rounds=50)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=50)
         pred_val = model.predict(X_val)
         val_rmse = root_mean_squared_error(y_val, pred_val)
-        print(f"[holdout] val RMSE = {val_rmse:.4f} mm/day | best_iteration={model.best_iteration_}")
+        print(f"[holdout] val RMSE = {val_rmse:.4f} mm/day | best_iteration={model.best_iteration}")
     else:
+        model = xgb.XGBRegressor(**params)
         model.fit(X_train, y_train)
 
     print(f"trained on device={device} in {time.time() - t0:.1f}s | rows={len(X_train)}")
 
-    out = config.MODELS_DIR / f"lgbm_{split}.txt"
-    model.booster_.save_model(str(out))
+    out = config.MODELS_DIR / f"xgb_{split}.json"
+    model.get_booster().save_model(str(out))
     print(f"wrote {out}")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", choices=["holdout", "full"], required=True)
-    ap.add_argument("--device", choices=["cpu", "gpu", "cuda"], default="cpu")
+    ap.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     ap.add_argument("--n-estimators", type=int, default=1000)
     ap.add_argument("--learning-rate", type=float, default=0.05)
     args = ap.parse_args()
