@@ -36,7 +36,7 @@ def train(split: str, device: str, epochs: int, batch_size: int, lr: float, pati
 
     model = PrecipCNN(in_channels=X.shape[1], clima_channel_idx=clima_idx).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
+    loss_fn = nn.SmoothL1Loss()  # Huber: more robust to heavy-tailed precip outliers than MSE
 
     has_val = split == "holdout"
     if has_val:
@@ -56,6 +56,7 @@ def train(split: str, device: str, epochs: int, batch_size: int, lr: float, pati
             pred = model(xb)
             loss = loss_fn(pred, yb)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
             train_loss += loss.item() * xb.size(0)
         train_loss /= len(loader.dataset)
@@ -94,7 +95,7 @@ def main() -> None:
     ap.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--batch-size", type=int, default=8)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--patience", type=int, default=20)
     args = ap.parse_args()
 
