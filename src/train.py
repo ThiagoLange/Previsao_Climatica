@@ -155,12 +155,13 @@ def train(
     min_child_weight: float = 5.0,
     reg_lambda: float = 5.0,
     reg_alpha: float = 0.5,
+    max_bin: int = 64,
 ) -> None:
     train_path = config.PROCESSED_DIR / f"features_train_{split}.parquet"
     feature_cols = _feature_cols(train_path)
 
     it = ParquetBatchIter(train_path, feature_cols, TARGET)
-    dtrain = xgb.QuantileDMatrix(it)
+    dtrain = xgb.QuantileDMatrix(it, max_bin=max_bin)
 
     params = dict(
         objective="reg:squarederror",
@@ -170,6 +171,7 @@ def train(
         min_child_weight=min_child_weight,
         reg_lambda=reg_lambda,
         reg_alpha=reg_alpha,
+        max_bin=max_bin,
         subsample=0.8,
         colsample_bytree=0.8,
         tree_method="hist",
@@ -181,7 +183,7 @@ def train(
     if split == "holdout":
         val_path = config.PROCESSED_DIR / "features_val_holdout.parquet"
         X_val, y_val, df_val = load_xy(val_path)
-        dval = xgb.QuantileDMatrix(X_val, label=y_val, ref=dtrain)
+        dval = xgb.QuantileDMatrix(X_val, label=y_val, ref=dtrain, max_bin=max_bin)
 
         booster = xgb.train(
             params,
@@ -220,6 +222,7 @@ def main() -> None:
     ap.add_argument("--min-child-weight", type=float, default=5.0)
     ap.add_argument("--reg-lambda", type=float, default=5.0)
     ap.add_argument("--reg-alpha", type=float, default=0.5)
+    ap.add_argument("--max-bin", type=int, default=64, help="histogram resolution; lower = less GPU memory")
     args = ap.parse_args()
 
     train(
@@ -231,6 +234,7 @@ def main() -> None:
         min_child_weight=args.min_child_weight,
         reg_lambda=args.reg_lambda,
         reg_alpha=args.reg_alpha,
+        max_bin=args.max_bin,
     )
 
 
