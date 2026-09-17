@@ -42,10 +42,15 @@ def build_natural_pairs(
     clim_atmos: dict[str, xr.DataArray],
     out_path,
     chunk_years: int = 5,
+    spatial_stride: int = 1,
 ) -> int:
     """Streams natural pairs to parquet in yearly chunks instead of materializing the
-    full 1940-cutoff history in pandas at once (spans 80+ years x 78.561 points x ~20
-    cols, easily 10s of GB as a single DataFrame -> OOMs constrained machines)."""
+    full 1940-cutoff history in pandas at once (spans 80+ years x 78.561 points x ~40
+    cols with the spatial+ONI features, tens of GB as a single DataFrame -> OOMs even
+    with the QuantileDMatrix DataIter). spatial_stride>1 additionally subsamples grid
+    points AFTER build_features (so the 5x5 neighbor-mean features are still computed
+    from the full-resolution grid) -- since lat/lon are model features, training on a
+    coarser spatial subset still generalizes to the full grid at inference/holdout."""
     shifted = _shift_forward_1m(atmos_ds)
     tp_target = atmos_ds[config.TP_VAR].rename("tp_target_obs")
 
@@ -71,6 +76,11 @@ def build_natural_pairs(
             )
 
             feat = build_features(base, tp_ultima_obs, tp_ultima_obs_time, clim_tp, clim_atmos)
+
+            if spatial_stride > 1:
+                feat = feat.isel(lat=slice(None, None, spatial_stride), lon=slice(None, None, spatial_stride))
+                target = target.isel(lat=slice(None, None, spatial_stride), lon=slice(None, None, spatial_stride))
+
             df = flatten(feat, target=target, with_id=False)
 
             table = pa.Table.from_pandas(df, preserve_index=False)
@@ -126,6 +136,13 @@ def build_test(clim_tp: xr.DataArray, clim_atmos: dict[str, xr.DataArray]) -> pd
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", choices=["holdout", "full"], required=True)
+    ap.add_argument(
+        "--spatial-stride",
+        type=int,
+        default=1,
+        help="subsample training grid points every N (lat/lon already features, so the "
+        "model still generalizes to the full grid); does not affect val/test resolution",
+    )
     args = ap.parse_args()
 
     atmos_ds = load_train_atmos()
@@ -135,7 +152,9 @@ def main():
         _save_climatology(clim_tp, clim_atmos, config.PROCESSED_DIR / "climatology_holdout.nc")
 
         out = config.PROCESSED_DIR / "features_train_holdout.parquet"
-        n_rows = build_natural_pairs(atmos_ds, config.HOLDOUT_TRAIN_END, clim_tp, clim_atmos, out)
+        n_rows = build_natural_pairs(
+            atmos_ds, config.HOLDOUT_TRAIN_END, clim_tp, clim_atmos, out, spatial_stride=args.spatial_stride
+        )
         print(f"wrote {out} | rows={n_rows}")
 
         df_val = build_holdout_val(atmos_ds, clim_tp, clim_atmos)
@@ -148,7 +167,9 @@ def main():
         _save_climatology(clim_tp, clim_atmos, config.PROCESSED_DIR / "climatology_full.nc")
 
         out = config.PROCESSED_DIR / "features_train_full.parquet"
-        n_rows = build_natural_pairs(atmos_ds, config.TRAIN_END, clim_tp, clim_atmos, out)
+        n_rows = build_natural_pairs(
+            atmos_ds, config.TRAIN_END, clim_tp, clim_atmos, out, spatial_stride=args.spatial_stride
+        )
         print(f"wrote {out} | rows={n_rows}")
 
         df_test = build_test(clim_tp, clim_atmos)
