@@ -59,12 +59,29 @@ class ParquetBatchIter(xgb.DataIter):
         return 1
 
 
-def load_xy(path) -> tuple[pd.DataFrame, "pd.Series"]:
+def load_xy(path) -> tuple[pd.DataFrame, "pd.Series", pd.DataFrame]:
     """Small parquet (val/test, ~24 months) -> load fully in memory, unlike the train split."""
     df = pd.read_parquet(path)
     y = df[TARGET]
     X = df.drop(columns=[c for c in NON_FEATURE_COLS if c in df.columns])
-    return X, y
+    return X, y, df
+
+
+def report_holdout(df_val: pd.DataFrame, y_val: pd.Series, pred_val) -> float:
+    overall = root_mean_squared_error(y_val, pred_val)
+    print(f"[holdout] val RMSE overall = {overall:.4f} mm/day")
+
+    sq_err = pd.Series((pred_val - y_val.values) ** 2, index=df_val.index)
+
+    by_lag = sq_err.groupby(df_val["lag_meses"].astype(int)).mean().pow(0.5)
+    for lag, val in by_lag.items():
+        print(f"  [holdout] RMSE lag={lag:02d} = {val:.4f}")
+
+    by_month = sq_err.groupby(df_val["time"].dt.month).mean().pow(0.5)
+    for month, val in by_month.items():
+        print(f"  [holdout] RMSE month={month:02d} = {val:.4f}")
+
+    return overall
 
 
 def train(split: str, device: str, n_estimators: int, learning_rate: float) -> None:
@@ -89,7 +106,7 @@ def train(split: str, device: str, n_estimators: int, learning_rate: float) -> N
     t0 = time.time()
     if split == "holdout":
         val_path = config.PROCESSED_DIR / "features_val_holdout.parquet"
-        X_val, y_val = load_xy(val_path)
+        X_val, y_val, df_val = load_xy(val_path)
         dval = xgb.QuantileDMatrix(X_val, label=y_val, ref=dtrain)
 
         booster = xgb.train(
@@ -101,8 +118,8 @@ def train(split: str, device: str, n_estimators: int, learning_rate: float) -> N
             verbose_eval=50,
         )
         pred_val = booster.predict(dval, iteration_range=(0, booster.best_iteration + 1))
-        val_rmse = root_mean_squared_error(y_val, pred_val)
-        print(f"[holdout] val RMSE = {val_rmse:.4f} mm/day | best_iteration={booster.best_iteration}")
+        report_holdout(df_val, y_val, pred_val)
+        print(f"[holdout] best_iteration={booster.best_iteration}")
     else:
         booster = xgb.train(params, dtrain, num_boost_round=n_estimators)
 
