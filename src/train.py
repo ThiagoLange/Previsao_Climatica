@@ -7,12 +7,18 @@
 --device cuda needs an NVIDIA GPU + driver visible to WSL/Linux (check `nvidia-smi`).
 No special build required: the standard `pip install xgboost` / `uv sync` wheel
 bundles CUDA support, unlike LightGBM which needs a from-source GPU build.
+
+The training parquet (features_train_<split>.parquet) spans 80+ years x 78.561 grid
+points and does not fit in RAM as a single pandas DataFrame on a 16GB machine, so it
+is streamed in row-group batches into an xgb.QuantileDMatrix via a DataIter instead
+of `pd.read_parquet` + `XGBRegressor.fit`.
 """
 
 import argparse
 import time
 
 import pandas as pd
+import pyarrow.parquet as pq
 import xgboost as xgb
 from sklearn.metrics import root_mean_squared_error
 
@@ -22,46 +28,88 @@ TARGET = "tp_alvo_true"
 NON_FEATURE_COLS = {"time", "id", TARGET}
 
 
-def load_xy(path) -> tuple[pd.DataFrame, "pd.Series", pd.DataFrame]:
+def _feature_cols(path) -> list[str]:
+    names = pq.ParquetFile(path).schema_arrow.names
+    return [c for c in names if c not in NON_FEATURE_COLS]
+
+
+class ParquetBatchIter(xgb.DataIter):
+    """Streams a parquet file's row groups as (X, y) batches for QuantileDMatrix,
+    so training never needs the whole file resident in pandas at once."""
+
+    def __init__(self, path, feature_cols: list[str], target_col: str, batch_rows: int = 4_000_000):
+        self.path = path
+        self.feature_cols = feature_cols
+        self.target_col = target_col
+        self.batch_rows = batch_rows
+        self._batches = None
+        super().__init__()
+
+    def reset(self) -> None:
+        pf = pq.ParquetFile(self.path)
+        self._batches = pf.iter_batches(batch_size=self.batch_rows, columns=[*self.feature_cols, self.target_col])
+
+    def next(self, input_data) -> int:
+        try:
+            batch = next(self._batches)
+        except StopIteration:
+            return 0
+        df = batch.to_pandas()
+        input_data(data=df[self.feature_cols], label=df[self.target_col])
+        return 1
+
+
+def load_xy(path) -> tuple[pd.DataFrame, "pd.Series"]:
+    """Small parquet (val/test, ~24 months) -> load fully in memory, unlike the train split."""
     df = pd.read_parquet(path)
     y = df[TARGET]
     X = df.drop(columns=[c for c in NON_FEATURE_COLS if c in df.columns])
-    return X, y, df
+    return X, y
 
 
 def train(split: str, device: str, n_estimators: int, learning_rate: float) -> None:
     train_path = config.PROCESSED_DIR / f"features_train_{split}.parquet"
-    X_train, y_train, _ = load_xy(train_path)
+    feature_cols = _feature_cols(train_path)
+
+    it = ParquetBatchIter(train_path, feature_cols, TARGET)
+    dtrain = xgb.QuantileDMatrix(it)
 
     params = dict(
-        n_estimators=n_estimators,
-        learning_rate=learning_rate,
+        objective="reg:squarederror",
+        eval_metric="rmse",
+        eta=learning_rate,
         max_depth=8,
         subsample=0.8,
         colsample_bytree=0.8,
         tree_method="hist",
         device=device,
-        random_state=42,
-        eval_metric="rmse",
+        seed=42,
     )
 
     t0 = time.time()
     if split == "holdout":
         val_path = config.PROCESSED_DIR / "features_val_holdout.parquet"
-        X_val, y_val, _ = load_xy(val_path)
-        model = xgb.XGBRegressor(**params, early_stopping_rounds=50)
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=50)
-        pred_val = model.predict(X_val)
-        val_rmse = root_mean_squared_error(y_val, pred_val)
-        print(f"[holdout] val RMSE = {val_rmse:.4f} mm/day | best_iteration={model.best_iteration}")
-    else:
-        model = xgb.XGBRegressor(**params)
-        model.fit(X_train, y_train)
+        X_val, y_val = load_xy(val_path)
+        dval = xgb.QuantileDMatrix(X_val, label=y_val, ref=dtrain)
 
-    print(f"trained on device={device} in {time.time() - t0:.1f}s | rows={len(X_train)}")
+        booster = xgb.train(
+            params,
+            dtrain,
+            num_boost_round=n_estimators,
+            evals=[(dval, "val")],
+            early_stopping_rounds=50,
+            verbose_eval=50,
+        )
+        pred_val = booster.predict(dval, iteration_range=(0, booster.best_iteration + 1))
+        val_rmse = root_mean_squared_error(y_val, pred_val)
+        print(f"[holdout] val RMSE = {val_rmse:.4f} mm/day | best_iteration={booster.best_iteration}")
+    else:
+        booster = xgb.train(params, dtrain, num_boost_round=n_estimators)
+
+    print(f"trained on device={device} in {time.time() - t0:.1f}s")
 
     out = config.MODELS_DIR / f"xgb_{split}.json"
-    model.get_booster().save_model(str(out))
+    booster.save_model(str(out))
     print(f"wrote {out}")
 
 
