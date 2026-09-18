@@ -30,6 +30,11 @@ TARGET = "tp_alvo_true"
 NON_FEATURE_COLS = {"time", "id", "time_origem", TARGET}
 
 
+def _nonnegative(values) -> np.ndarray:
+    """Precipitation cannot be negative; keep validation/blending consistent with submission."""
+    return np.maximum(np.asarray(values, dtype="float32"), 0.0)
+
+
 def _feature_cols(path) -> list[str]:
     names = pq.ParquetFile(path).schema_arrow.names
     return [c for c in names if c not in NON_FEATURE_COLS]
@@ -97,15 +102,16 @@ def search_blend_alpha(df_val: pd.DataFrame, y_val: pd.Series, pred_val) -> floa
     model roughly ties climatology overall but loses in low-variance months -- a convex
     blend can keep the model's gains where it wins without its noise where it doesn't."""
     y = y_val.values
-    clima = df_val["clima_alvo"].values
+    clima = _nonnegative(df_val["clima_alvo"].values)
+    pred_val = _nonnegative(pred_val)
 
     rmse_model = root_mean_squared_error(y, pred_val)
     rmse_clima = root_mean_squared_error(y, clima)
     print(f"[blend] alpha=1.00 (modelo puro)      RMSE = {rmse_model:.4f}")
     print(f"[blend] alpha=0.00 (climatologia pura) RMSE = {rmse_clima:.4f}")
 
-    best_alpha, best_rmse = 1.0, rmse_model
-    for alpha in np.arange(0.05, 1.0, 0.05):
+    best_alpha, best_rmse = 0.0, rmse_clima
+    for alpha in np.linspace(0.0, 1.0, 21):
         blended = alpha * pred_val + (1 - alpha) * clima
         rmse = root_mean_squared_error(y, blended)
         if rmse < best_rmse:
@@ -119,7 +125,8 @@ def search_blend_alpha_by_lag(df_val: pd.DataFrame, y_val: pd.Series, pred_val, 
     """Per-lag alpha instead of one global value: low lag (more atmospheric signal) and
     high lag (degrades toward pure climatology) likely want different blend weights."""
     y = y_val.values
-    clima = df_val["clima_alvo"].values
+    clima = _nonnegative(df_val["clima_alvo"].values)
+    pred_val = _nonnegative(pred_val)
     lag = df_val["lag_meses"].astype(int).values
 
     alphas: dict[int, float] = {}
@@ -167,7 +174,8 @@ def search_blend_alpha_by_region(
     very different rainfall regimes, so how much to trust the model vs. climatology likely
     varies by region too, not just by how stale the last real observation is."""
     y = y_val.values
-    clima = df_val["clima_alvo"].values
+    clima = _nonnegative(df_val["clima_alvo"].values)
+    pred_val = _nonnegative(pred_val)
     lag = df_val["lag_meses"].astype(int).values
     lat_band = _lat_band(df_val["lat"].values)
 
@@ -206,40 +214,60 @@ def apply_region_alpha(df: pd.DataFrame, model_pred, alphas: dict, default_alpha
     return alpha_arr * model_pred + (1 - alpha_arr) * clima
 
 
-def cv_check_region_alpha(df_val: pd.DataFrame, y_val: pd.Series, pred_val, default_alpha: float) -> None:
-    """Honest generalization check: tunes the (lag, lat_band) alpha table on one year of the
-    holdout and scores it on the other year, since the in-sample number alone already fooled
-    us once (6-bin version looked great in-sample but scored worse than plain per-lag alpha
-    on the real leaderboard -- too many free parameters tuned on only 24 months)."""
+def cv_check_region_alpha(
+    df_val: pd.DataFrame, y_val: pd.Series, pred_val, default_alpha: float
+) -> tuple[float, float] | None:
+    """Return (regional OOF RMSE, global-alpha OOF RMSE) before enabling regional blending."""
     years = df_val["time"].dt.year.values
     uniq_years = sorted(set(years))
     if len(uniq_years) < 2:
         print("[blend-cv] holdout tem so 1 ano, pulando checagem cruzada")
-        return
+        return None
 
     mid = len(uniq_years) // 2
     fold_defs = [set(uniq_years[:mid]), set(uniq_years[mid:])]
 
     y = y_val.values
-    oof_rmses = []
+    pred_val = _nonnegative(pred_val)
+    oof_region = []
+    oof_global = []
     for test_years in fold_defs:
         test_mask = np.isin(years, list(test_years))
         train_mask = ~test_mask
 
-        alphas = search_blend_alpha_by_region(
-            df_val[train_mask].reset_index(drop=True),
-            y_val[train_mask].reset_index(drop=True),
-            pred_val[train_mask],
-            default_alpha,
-        )
-        blended_test = apply_region_alpha(
-            df_val[test_mask].reset_index(drop=True), pred_val[test_mask], alphas, default_alpha
-        )
-        rmse = root_mean_squared_error(y[test_mask], blended_test)
-        oof_rmses.append(rmse)
-        print(f"[blend-cv] tunado em {sorted(set(years) - test_years)}, testado em {sorted(test_years)}: RMSE={rmse:.4f}")
+        train_df = df_val[train_mask].reset_index(drop=True)
+        train_y = y_val[train_mask].reset_index(drop=True)
+        test_df = df_val[test_mask].reset_index(drop=True)
 
-    print(f"[blend-cv] RMSE fora-da-amostra medio = {np.mean(oof_rmses):.4f} (compara com o in-sample acima e com o alpha por lag)")
+        fold_global_alpha = search_blend_alpha(train_df, train_y, pred_val[train_mask])
+        global_test = _nonnegative(
+            fold_global_alpha * pred_val[test_mask]
+            + (1 - fold_global_alpha) * test_df["clima_alvo"].values
+        )
+        global_rmse = root_mean_squared_error(y[test_mask], global_test)
+
+        alphas = search_blend_alpha_by_region(
+            train_df, train_y, pred_val[train_mask], fold_global_alpha
+        )
+        regional_test = _nonnegative(
+            apply_region_alpha(test_df, pred_val[test_mask], alphas, fold_global_alpha)
+        )
+        regional_rmse = root_mean_squared_error(y[test_mask], regional_test)
+
+        oof_global.append(global_rmse)
+        oof_region.append(regional_rmse)
+        print(
+            f"[blend-cv] tunado em {sorted(set(years) - test_years)}, "
+            f"testado em {sorted(test_years)}: global={global_rmse:.4f} regional={regional_rmse:.4f}"
+        )
+
+    global_mean = float(np.mean(oof_global))
+    region_mean = float(np.mean(oof_region))
+    print(
+        f"[blend-cv] OOF global={global_mean:.4f} regional={region_mean:.4f}; "
+        "regional só será habilitado se vencer fora da amostra"
+    )
+    return region_mean, global_mean
 
 
 def train(
@@ -293,6 +321,7 @@ def train(
             verbose_eval=50,
         )
         pred_val = booster.predict(dval, iteration_range=(0, booster.best_iteration + 1))
+        pred_val = _nonnegative(pred_val)
         report_holdout(df_val, y_val, pred_val)
         print(f"[holdout] best_iteration={booster.best_iteration}")
         global_alpha = search_blend_alpha(df_val, y_val, pred_val)
@@ -303,11 +332,21 @@ def train(
         print(f"wrote {alpha_path}")
 
         alphas_by_region = search_blend_alpha_by_region(df_val, y_val, pred_val, global_alpha)
+        region_cv = cv_check_region_alpha(df_val, y_val, pred_val, global_alpha)
+        region_enabled = bool(region_cv is not None and region_cv[0] < region_cv[1] - 1e-4)
         region_path = config.MODELS_DIR / "blend_alpha_by_region.json"
-        region_path.write_text(json.dumps({"default": global_alpha, "by_lag_latband": alphas_by_region}, indent=2))
-        print(f"wrote {region_path}")
+        region_path.write_text(
+            json.dumps(
+                {
+                    "enabled": region_enabled,
+                    "default": global_alpha,
+                    "by_lag_latband": alphas_by_region,
+                },
+                indent=2,
+            )
+        )
+        print(f"wrote {region_path} | enabled={region_enabled}")
 
-        cv_check_region_alpha(df_val, y_val, pred_val, global_alpha)
     else:
         booster = xgb.train(params, dtrain, num_boost_round=n_estimators)
 

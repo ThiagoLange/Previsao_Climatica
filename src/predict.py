@@ -9,10 +9,10 @@ Blends the model prediction with the `clima_alvo` climatology feature already pr
 in the parquet: `pred = alpha*model + (1-alpha)*clima_alvo`. Uses a per-lag_meses alpha
 from `models/blend_alpha_by_lag.json` (written by `train.py --split holdout`) when
 available, since low lag (more atmospheric signal) and high lag (degrades toward pure
-climatology) want different blend weights. Falls back to a single --alpha (default
-0.45, the holdout-tuned global value: RMSE 1.8733 vs 1.9095 pure model / 1.8938 pure
-climatology) when the file is missing. The real test set has no labels to retune
-against, so whatever was tuned on the holdout is carried over as-is.
+climatology) want different blend weights. Falls back to a single --alpha when no
+validated blending configuration is available. Predictions are clipped at zero before
+submission. The real test set has no labels to retune against, so holdout tuning is
+carried over as-is.
 """
 
 import argparse
@@ -43,10 +43,11 @@ def predict(split: str, model_path=None, alpha: float = BLEND_ALPHA) -> pd.DataF
     else:
         X = df.drop(columns=[c for c in NON_FEATURE_COLS if c in df.columns])
     model_pred = booster.predict(xgb.DMatrix(X))
+    model_pred = model_pred.clip(min=0.0)
 
     region_path = config.MODELS_DIR / "blend_alpha_by_region.json"
     lag_path = config.MODELS_DIR / "blend_alpha_by_lag.json"
-    if region_path.exists():
+    if region_path.exists() and json.loads(region_path.read_text()).get("enabled", False):
         region_config = json.loads(region_path.read_text())
         blended = apply_region_alpha(df, model_pred, region_config["by_lag_latband"], region_config["default"])
         print(f"blend: usando alpha por (lag, faixa lat) de {region_path}")
@@ -59,7 +60,7 @@ def predict(split: str, model_path=None, alpha: float = BLEND_ALPHA) -> pd.DataF
         blended = alpha * model_pred + (1 - alpha) * df["clima_alvo"].values
         print(f"blend: nenhum json de alpha encontrado, usando alpha global={alpha}")
 
-    return pd.DataFrame({"id": df["id"], "tp_mm_day": blended})
+    return pd.DataFrame({"id": df["id"], "tp_mm_day": blended.clip(min=0.0)})
 
 
 def main() -> None:
