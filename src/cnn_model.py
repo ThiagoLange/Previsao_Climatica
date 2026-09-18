@@ -25,7 +25,7 @@ class PrecipCNN(nn.Module):
             d = dilations[i % len(dilations)]
             layers += [
                 nn.Conv2d(c_in, hidden, kernel_size=3, padding=d, dilation=d),
-                nn.BatchNorm2d(hidden),
+                nn.GroupNorm(num_groups=8, num_channels=hidden),  # per-sample, no running-stat drift like BatchNorm
                 nn.ReLU(inplace=True),
             ]
             c_in = hidden
