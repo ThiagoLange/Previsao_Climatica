@@ -57,10 +57,7 @@ class ParquetBatchIter(xgb.DataIter):
         except StopIteration:
             return 0
         df = batch.to_pandas()
-        # log1p target: precip is heavy-tailed/non-negative, training in log space fits
-        # trees better than raw mm/day; predict.py/train() undo it with expm1.
-        label = np.log1p(df[self.target_col].clip(lower=0))
-        input_data(data=df[self.feature_cols], label=label)
+        input_data(data=df[self.feature_cols], label=df[self.target_col])
         return 1
 
 
@@ -155,7 +152,7 @@ def apply_lag_alpha(df: pd.DataFrame, model_pred, alphas_by_lag: dict[int, float
     return alpha_arr * model_pred + (1 - alpha_arr) * clima
 
 
-LAT_MIN, LAT_MAX, N_LAT_BINS = -60.0, 15.0, 6
+LAT_MIN, LAT_MAX, N_LAT_BINS = -60.0, 15.0, 3
 
 
 def _lat_band(lat_values) -> np.ndarray:
@@ -209,6 +206,42 @@ def apply_region_alpha(df: pd.DataFrame, model_pred, alphas: dict, default_alpha
     return alpha_arr * model_pred + (1 - alpha_arr) * clima
 
 
+def cv_check_region_alpha(df_val: pd.DataFrame, y_val: pd.Series, pred_val, default_alpha: float) -> None:
+    """Honest generalization check: tunes the (lag, lat_band) alpha table on one year of the
+    holdout and scores it on the other year, since the in-sample number alone already fooled
+    us once (6-bin version looked great in-sample but scored worse than plain per-lag alpha
+    on the real leaderboard -- too many free parameters tuned on only 24 months)."""
+    years = df_val["time"].dt.year.values
+    uniq_years = sorted(set(years))
+    if len(uniq_years) < 2:
+        print("[blend-cv] holdout tem so 1 ano, pulando checagem cruzada")
+        return
+
+    mid = len(uniq_years) // 2
+    fold_defs = [set(uniq_years[:mid]), set(uniq_years[mid:])]
+
+    y = y_val.values
+    oof_rmses = []
+    for test_years in fold_defs:
+        test_mask = np.isin(years, list(test_years))
+        train_mask = ~test_mask
+
+        alphas = search_blend_alpha_by_region(
+            df_val[train_mask].reset_index(drop=True),
+            y_val[train_mask].reset_index(drop=True),
+            pred_val[train_mask],
+            default_alpha,
+        )
+        blended_test = apply_region_alpha(
+            df_val[test_mask].reset_index(drop=True), pred_val[test_mask], alphas, default_alpha
+        )
+        rmse = root_mean_squared_error(y[test_mask], blended_test)
+        oof_rmses.append(rmse)
+        print(f"[blend-cv] tunado em {sorted(set(years) - test_years)}, testado em {sorted(test_years)}: RMSE={rmse:.4f}")
+
+    print(f"[blend-cv] RMSE fora-da-amostra medio = {np.mean(oof_rmses):.4f} (compara com o in-sample acima e com o alpha por lag)")
+
+
 def train(
     split: str,
     device: str,
@@ -249,8 +282,7 @@ def train(
     if split == "holdout":
         val_path = config.PROCESSED_DIR / "features_val_holdout.parquet"
         X_val, y_val, df_val = load_xy(val_path, feature_cols)
-        y_val_log = np.log1p(y_val.clip(lower=0))
-        dval = xgb.QuantileDMatrix(X_val, label=y_val_log, ref=dtrain, max_bin=max_bin)
+        dval = xgb.QuantileDMatrix(X_val, label=y_val, ref=dtrain, max_bin=max_bin)
 
         booster = xgb.train(
             params,
@@ -260,8 +292,7 @@ def train(
             early_stopping_rounds=50,
             verbose_eval=50,
         )
-        pred_val_log = booster.predict(dval, iteration_range=(0, booster.best_iteration + 1))
-        pred_val = np.expm1(pred_val_log)
+        pred_val = booster.predict(dval, iteration_range=(0, booster.best_iteration + 1))
         report_holdout(df_val, y_val, pred_val)
         print(f"[holdout] best_iteration={booster.best_iteration}")
         global_alpha = search_blend_alpha(df_val, y_val, pred_val)
@@ -275,6 +306,8 @@ def train(
         region_path = config.MODELS_DIR / "blend_alpha_by_region.json"
         region_path.write_text(json.dumps({"default": global_alpha, "by_lag_latband": alphas_by_region}, indent=2))
         print(f"wrote {region_path}")
+
+        cv_check_region_alpha(df_val, y_val, pred_val, global_alpha)
     else:
         booster = xgb.train(params, dtrain, num_boost_round=n_estimators)
 
