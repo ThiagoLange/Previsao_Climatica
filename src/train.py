@@ -57,7 +57,10 @@ class ParquetBatchIter(xgb.DataIter):
         except StopIteration:
             return 0
         df = batch.to_pandas()
-        input_data(data=df[self.feature_cols], label=df[self.target_col])
+        # log1p target: precip is heavy-tailed/non-negative, training in log space fits
+        # trees better than raw mm/day; predict.py/train() undo it with expm1.
+        label = np.log1p(df[self.target_col].clip(lower=0))
+        input_data(data=df[self.feature_cols], label=label)
         return 1
 
 
@@ -192,7 +195,8 @@ def train(
     if split == "holdout":
         val_path = config.PROCESSED_DIR / "features_val_holdout.parquet"
         X_val, y_val, df_val = load_xy(val_path, feature_cols)
-        dval = xgb.QuantileDMatrix(X_val, label=y_val, ref=dtrain, max_bin=max_bin)
+        y_val_log = np.log1p(y_val.clip(lower=0))
+        dval = xgb.QuantileDMatrix(X_val, label=y_val_log, ref=dtrain, max_bin=max_bin)
 
         booster = xgb.train(
             params,
@@ -202,7 +206,8 @@ def train(
             early_stopping_rounds=50,
             verbose_eval=50,
         )
-        pred_val = booster.predict(dval, iteration_range=(0, booster.best_iteration + 1))
+        pred_val_log = booster.predict(dval, iteration_range=(0, booster.best_iteration + 1))
+        pred_val = np.expm1(pred_val_log)
         report_holdout(df_val, y_val, pred_val)
         print(f"[holdout] best_iteration={booster.best_iteration}")
         global_alpha = search_blend_alpha(df_val, y_val, pred_val)

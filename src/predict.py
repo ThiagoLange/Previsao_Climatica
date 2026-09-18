@@ -18,6 +18,7 @@ against, so whatever was tuned on the holdout is carried over as-is.
 import argparse
 import json
 
+import numpy as np
 import pandas as pd
 import xgboost as xgb
 
@@ -42,7 +43,7 @@ def predict(split: str, model_path=None, alpha: float = BLEND_ALPHA) -> pd.DataF
         X = df[feature_cols]
     else:
         X = df.drop(columns=[c for c in NON_FEATURE_COLS if c in df.columns])
-    model_pred = booster.predict(xgb.DMatrix(X))
+    model_pred = np.expm1(booster.predict(xgb.DMatrix(X)))  # undo train.py's log1p target
 
     alpha_path = config.MODELS_DIR / "blend_alpha_by_lag.json"
     if alpha_path.exists():
