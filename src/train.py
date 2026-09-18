@@ -155,6 +155,60 @@ def apply_lag_alpha(df: pd.DataFrame, model_pred, alphas_by_lag: dict[int, float
     return alpha_arr * model_pred + (1 - alpha_arr) * clima
 
 
+LAT_MIN, LAT_MAX, N_LAT_BINS = -60.0, 15.0, 6
+
+
+def _lat_band(lat_values) -> np.ndarray:
+    edges = np.linspace(LAT_MIN, LAT_MAX, N_LAT_BINS + 1)
+    return np.clip(np.digitize(lat_values, edges) - 1, 0, N_LAT_BINS - 1)
+
+
+def search_blend_alpha_by_region(
+    df_val: pd.DataFrame, y_val: pd.Series, pred_val, default_alpha: float
+) -> dict[str, float]:
+    """Alpha per (lag, latitude band) instead of per-lag alone: Andes/Amazonia/Pampas have
+    very different rainfall regimes, so how much to trust the model vs. climatology likely
+    varies by region too, not just by how stale the last real observation is."""
+    y = y_val.values
+    clima = df_val["clima_alvo"].values
+    lag = df_val["lag_meses"].astype(int).values
+    lat_band = _lat_band(df_val["lat"].values)
+
+    groups = pd.DataFrame({"lag": lag, "lat_band": lat_band}).groupby(["lag", "lat_band"]).indices
+
+    alphas: dict[tuple[int, int], float] = {}
+    for (l, b), idx in groups.items():
+        y_g, pred_g, clima_g = y[idx], pred_val[idx], clima[idx]
+        best_alpha, best_rmse = 1.0, root_mean_squared_error(y_g, pred_g)
+        for alpha in np.arange(0.0, 1.01, 0.05):
+            blended = alpha * pred_g + (1 - alpha) * clima_g
+            rmse = root_mean_squared_error(y_g, blended)
+            if rmse < best_rmse:
+                best_alpha, best_rmse = alpha, rmse
+        alphas[(int(l), int(b))] = round(float(best_alpha), 2)
+
+    blended_all = apply_region_alpha(df_val, pred_val, alphas, default_alpha)
+    rmse_all = root_mean_squared_error(y, blended_all)
+    print(f"[blend] alpha por (lag, faixa lat) (aplicado geral) RMSE = {rmse_all:.4f}")
+
+    return {f"{l}_{b}": a for (l, b), a in alphas.items()}
+
+
+def apply_region_alpha(df: pd.DataFrame, model_pred, alphas: dict, default_alpha: float, n_lag: int = 25):
+    if alphas and isinstance(next(iter(alphas)), str):
+        alphas = {tuple(int(x) for x in k.split("_")): v for k, v in alphas.items()}
+
+    table = np.full((n_lag, N_LAT_BINS), default_alpha, dtype="float32")
+    for (l, b), a in alphas.items():
+        table[l, b] = a
+
+    lag = df["lag_meses"].astype(int).values
+    lat_band = _lat_band(df["lat"].values)
+    alpha_arr = table[lag, lat_band]
+    clima = df["clima_alvo"].values
+    return alpha_arr * model_pred + (1 - alpha_arr) * clima
+
+
 def train(
     split: str,
     device: str,
@@ -216,6 +270,11 @@ def train(
         alpha_path = config.MODELS_DIR / "blend_alpha_by_lag.json"
         alpha_path.write_text(json.dumps({"default": global_alpha, "by_lag": alphas_by_lag}, indent=2))
         print(f"wrote {alpha_path}")
+
+        alphas_by_region = search_blend_alpha_by_region(df_val, y_val, pred_val, global_alpha)
+        region_path = config.MODELS_DIR / "blend_alpha_by_region.json"
+        region_path.write_text(json.dumps({"default": global_alpha, "by_lag_latband": alphas_by_region}, indent=2))
+        print(f"wrote {region_path}")
     else:
         booster = xgb.train(params, dtrain, num_boost_round=n_estimators)
 

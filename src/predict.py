@@ -24,7 +24,7 @@ import xgboost as xgb
 
 from . import config
 from .make_submission import build_submission
-from .train import NON_FEATURE_COLS, apply_lag_alpha
+from .train import NON_FEATURE_COLS, apply_lag_alpha, apply_region_alpha
 
 BLEND_ALPHA = 0.45
 
@@ -45,15 +45,20 @@ def predict(split: str, model_path=None, alpha: float = BLEND_ALPHA) -> pd.DataF
         X = df.drop(columns=[c for c in NON_FEATURE_COLS if c in df.columns])
     model_pred = np.expm1(booster.predict(xgb.DMatrix(X)))  # undo train.py's log1p target
 
-    alpha_path = config.MODELS_DIR / "blend_alpha_by_lag.json"
-    if alpha_path.exists():
-        alpha_config = json.loads(alpha_path.read_text())
+    region_path = config.MODELS_DIR / "blend_alpha_by_region.json"
+    lag_path = config.MODELS_DIR / "blend_alpha_by_lag.json"
+    if region_path.exists():
+        region_config = json.loads(region_path.read_text())
+        blended = apply_region_alpha(df, model_pred, region_config["by_lag_latband"], region_config["default"])
+        print(f"blend: usando alpha por (lag, faixa lat) de {region_path}")
+    elif lag_path.exists():
+        alpha_config = json.loads(lag_path.read_text())
         alphas_by_lag = {int(k): v for k, v in alpha_config["by_lag"].items()}
         blended = apply_lag_alpha(df, model_pred, alphas_by_lag, alpha_config["default"])
-        print(f"blend: usando alpha por lag de {alpha_path}")
+        print(f"blend: usando alpha por lag de {lag_path}")
     else:
         blended = alpha * model_pred + (1 - alpha) * df["clima_alvo"].values
-        print(f"blend: {alpha_path} nao encontrado, usando alpha global={alpha}")
+        print(f"blend: nenhum json de alpha encontrado, usando alpha global={alpha}")
 
     return pd.DataFrame({"id": df["id"], "tp_mm_day": blended})
 
