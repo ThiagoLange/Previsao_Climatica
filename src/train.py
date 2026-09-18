@@ -1,4 +1,8 @@
-"""CLI: trains an XGBoost regressor on the parquet features from build_dataset.
+"""CLI: trains an XGBoost regressor on parquet features from build_dataset.
+
+The recommended ``--target-mode residual`` learns tp_alvo_true - clima_alvo and
+adds that anomaly back at validation/inference time, which makes the model focus
+on departures from the strong seasonal baseline.
 
     uv run python -m src.train --split holdout                 # CPU
     uv run python -m src.train --split holdout --device cuda    # GPU, pip-installed xgboost already ships CUDA support
@@ -44,11 +48,21 @@ class ParquetBatchIter(xgb.DataIter):
     """Streams a parquet file's row groups as (X, y) batches for QuantileDMatrix,
     so training never needs the whole file resident in pandas at once."""
 
-    def __init__(self, path, feature_cols: list[str], target_col: str, batch_rows: int = 4_000_000):
+    def __init__(
+        self,
+        path,
+        feature_cols: list[str],
+        target_col: str,
+        batch_rows: int = 4_000_000,
+        target_mode: str = "raw",
+    ):
         self.path = path
         self.feature_cols = feature_cols
         self.target_col = target_col
         self.batch_rows = batch_rows
+        self.target_mode = target_mode
+        if target_mode not in {"raw", "residual"}:
+            raise ValueError(f"unknown target_mode={target_mode}")
         self._batches = None
         super().__init__()
 
@@ -62,7 +76,10 @@ class ParquetBatchIter(xgb.DataIter):
         except StopIteration:
             return 0
         df = batch.to_pandas()
-        input_data(data=df[self.feature_cols], label=df[self.target_col])
+        label = df[self.target_col].to_numpy(dtype="float32")
+        if self.target_mode == "residual":
+            label = label - df["clima_alvo"].to_numpy(dtype="float32")
+        input_data(data=df[self.feature_cols], label=label)
         return 1
 
 
@@ -157,6 +174,88 @@ def apply_lag_alpha(df: pd.DataFrame, model_pred, alphas_by_lag: dict[int, float
     alpha_arr = np.array([alphas_by_lag.get(int(l), default_alpha) for l in lag])
     clima = df["clima_alvo"].values
     return alpha_arr * model_pred + (1 - alpha_arr) * clima
+
+
+def search_blend_alpha_by_month(
+    df_val: pd.DataFrame, y_val: pd.Series, pred_val, default_alpha: float
+) -> dict[int, float]:
+    """Tune a seasonal model/climatology weight, without mixing rainfall regimes."""
+    y = y_val.values
+    clima = _nonnegative(df_val["clima_alvo"].values)
+    pred_val = _nonnegative(pred_val)
+    months = df_val["time"].dt.month.astype(int).values
+    alphas: dict[int, float] = {}
+    for month in sorted(set(months)):
+        mask = months == month
+        y_m, pred_m, clima_m = y[mask], pred_val[mask], clima[mask]
+        best_alpha, best_rmse = default_alpha, float("inf")
+        for alpha in np.arange(0.0, 1.01, 0.05):
+            rmse = root_mean_squared_error(y_m, alpha * pred_m + (1 - alpha) * clima_m)
+            if rmse < best_rmse:
+                best_alpha, best_rmse = alpha, rmse
+        alphas[month] = round(float(best_alpha), 2)
+        print(f"  month={month:02d} alpha={best_alpha:.2f} RMSE={best_rmse:.4f}")
+
+    blended = apply_month_alpha(df_val, pred_val, alphas, default_alpha)
+    print(f"[blend] alpha por mês (aplicado geral) RMSE = {root_mean_squared_error(y, blended):.4f}")
+    return alphas
+
+
+def apply_month_alpha(df: pd.DataFrame, model_pred, alphas_by_month: dict[int, float], default_alpha: float):
+    months = df["time"].dt.month.astype(int).values
+    alpha_arr = np.array([alphas_by_month.get(int(m), default_alpha) for m in months])
+    clima = df["clima_alvo"].values
+    return alpha_arr * model_pred + (1 - alpha_arr) * clima
+
+
+def cv_check_month_alpha(
+    df_val: pd.DataFrame, y_val: pd.Series, pred_val, default_alpha: float
+) -> tuple[float, float] | None:
+    """Enable month-specific blending only when it wins in year-held-out validation."""
+    years = df_val["time"].dt.year.values
+    uniq_years = sorted(set(years))
+    if len(uniq_years) < 2:
+        return None
+
+    mid = len(uniq_years) // 2
+    fold_defs = [set(uniq_years[:mid]), set(uniq_years[mid:])]
+    y = y_val.values
+    pred_val = _nonnegative(pred_val)
+    oof_month, oof_global = [], []
+    for test_years in fold_defs:
+        test_mask = np.isin(years, list(test_years))
+        train_mask = ~test_mask
+        train_df = df_val[train_mask].reset_index(drop=True)
+        train_y = y_val[train_mask].reset_index(drop=True)
+        test_df = df_val[test_mask].reset_index(drop=True)
+
+        fold_global = search_blend_alpha(train_df, train_y, pred_val[train_mask])
+        global_test = _nonnegative(
+            fold_global * pred_val[test_mask]
+            + (1 - fold_global) * test_df["clima_alvo"].values
+        )
+        global_rmse = root_mean_squared_error(y[test_mask], global_test)
+
+        month_alphas = search_blend_alpha_by_month(
+            train_df, train_y, pred_val[train_mask], fold_global
+        )
+        month_test = _nonnegative(
+            apply_month_alpha(test_df, pred_val[test_mask], month_alphas, fold_global)
+        )
+        month_rmse = root_mean_squared_error(y[test_mask], month_test)
+        oof_global.append(global_rmse)
+        oof_month.append(month_rmse)
+        print(
+            f"[blend-cv-month] tunado em {sorted(set(years) - test_years)}, "
+            f"testado em {sorted(test_years)}: global={global_rmse:.4f} mensal={month_rmse:.4f}"
+        )
+
+    month_mean, global_mean = float(np.mean(oof_month)), float(np.mean(oof_global))
+    print(
+        f"[blend-cv-month] OOF global={global_mean:.4f} mensal={month_mean:.4f}; "
+        "mensal só será habilitado se vencer fora da amostra"
+    )
+    return month_mean, global_mean
 
 
 LAT_MIN, LAT_MAX, N_LAT_BINS = -60.0, 15.0, 3
@@ -280,6 +379,7 @@ def train(
     reg_lambda: float = 5.0,
     reg_alpha: float = 0.5,
     max_bin: int = 64,
+    target_mode: str = "raw",
 ) -> None:
     train_path = config.PROCESSED_DIR / f"features_train_{split}.parquet"
     feature_cols = _feature_cols(train_path)
@@ -287,7 +387,7 @@ def train(
     cols_path = config.MODELS_DIR / f"feature_cols_{split}.json"
     cols_path.write_text(json.dumps(feature_cols))
 
-    it = ParquetBatchIter(train_path, feature_cols, TARGET)
+    it = ParquetBatchIter(train_path, feature_cols, TARGET, target_mode=target_mode)
     dtrain = xgb.QuantileDMatrix(it, max_bin=max_bin)
 
     params = dict(
@@ -310,7 +410,10 @@ def train(
     if split == "holdout":
         val_path = config.PROCESSED_DIR / "features_val_holdout.parquet"
         X_val, y_val, df_val = load_xy(val_path, feature_cols)
-        dval = xgb.QuantileDMatrix(X_val, label=y_val, ref=dtrain, max_bin=max_bin)
+        y_val_train = y_val.to_numpy(dtype="float32")
+        if target_mode == "residual":
+            y_val_train = y_val_train - X_val["clima_alvo"].to_numpy(dtype="float32")
+        dval = xgb.QuantileDMatrix(X_val, label=y_val_train, ref=dtrain, max_bin=max_bin)
 
         booster = xgb.train(
             params,
@@ -321,6 +424,8 @@ def train(
             verbose_eval=50,
         )
         pred_val = booster.predict(dval, iteration_range=(0, booster.best_iteration + 1))
+        if target_mode == "residual":
+            pred_val = pred_val + df_val["clima_alvo"].to_numpy()
         pred_val = _nonnegative(pred_val)
         report_holdout(df_val, y_val, pred_val)
         print(f"[holdout] best_iteration={booster.best_iteration}")
@@ -330,6 +435,18 @@ def train(
         alpha_path = config.MODELS_DIR / "blend_alpha_by_lag.json"
         alpha_path.write_text(json.dumps({"default": global_alpha, "by_lag": alphas_by_lag}, indent=2))
         print(f"wrote {alpha_path}")
+
+        alphas_by_month = search_blend_alpha_by_month(df_val, y_val, pred_val, global_alpha)
+        month_cv = cv_check_month_alpha(df_val, y_val, pred_val, global_alpha)
+        month_enabled = bool(month_cv is not None and month_cv[0] < month_cv[1] - 1e-4)
+        month_path = config.MODELS_DIR / "blend_alpha_by_month.json"
+        month_path.write_text(
+            json.dumps(
+                {"enabled": month_enabled, "default": global_alpha, "by_month": alphas_by_month},
+                indent=2,
+            )
+        )
+        print(f"wrote {month_path} | enabled={month_enabled}")
 
         alphas_by_region = search_blend_alpha_by_region(df_val, y_val, pred_val, global_alpha)
         region_cv = cv_check_region_alpha(df_val, y_val, pred_val, global_alpha)
@@ -354,7 +471,9 @@ def train(
 
     out = config.MODELS_DIR / f"xgb_{split}.json"
     booster.save_model(str(out))
-    print(f"wrote {out}")
+    meta_path = config.MODELS_DIR / f"xgb_{split}_meta.json"
+    meta_path.write_text(json.dumps({"target_mode": target_mode}, indent=2))
+    print(f"wrote {out} | target_mode={target_mode}")
 
 
 def main() -> None:
@@ -368,6 +487,10 @@ def main() -> None:
     ap.add_argument("--reg-lambda", type=float, default=5.0)
     ap.add_argument("--reg-alpha", type=float, default=0.5)
     ap.add_argument("--max-bin", type=int, default=64, help="histogram resolution; lower = less GPU memory")
+    ap.add_argument(
+        "--target-mode", choices=["raw", "residual"], default="raw",
+        help="train raw precipitation or the anomaly residual tp_alvo_true - clima_alvo",
+    )
     args = ap.parse_args()
 
     train(
@@ -380,6 +503,7 @@ def main() -> None:
         reg_lambda=args.reg_lambda,
         reg_alpha=args.reg_alpha,
         max_bin=args.max_bin,
+        target_mode=args.target_mode,
     )
 
 
