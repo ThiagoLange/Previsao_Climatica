@@ -16,7 +16,7 @@ import xarray as xr
 
 from . import config
 from .climatology import climatology_for_months
-from .external_data import oni_features
+from .external_data import causal_index_features
 
 
 def _prev_month(month: xr.DataArray) -> xr.DataArray:
@@ -69,9 +69,18 @@ def build_features(
     feat["lag_meses"] = target_ym - last_obs_ym
 
     obs_actual_time = base["time"].to_index() - pd.DateOffset(months=1)
-    oni, oni_available = oni_features(obs_actual_time)
-    feat["oni"] = xr.DataArray(oni, dims="time", coords={"time": base["time"]})
-    feat["oni_available"] = xr.DataArray(oni_available, dims="time", coords={"time": base["time"]})
+    # All climate indices are evaluated at target-1. The legacy seasonal ONI
+    # is intentionally not used because a season such as DJF can include the
+    # target month. Keep the old column names as causal aliases for compatibility.
+    causal = causal_index_features(obs_actual_time)
+    feat["oni"] = xr.DataArray(
+        causal["oni_causal_ma3"], dims="time", coords={"time": base["time"]}
+    )
+    feat["oni_available"] = xr.DataArray(
+        causal["oni_causal_available"], dims="time", coords={"time": base["time"]}
+    )
+    for name, values in causal.items():
+        feat[name] = xr.DataArray(values, dims="time", coords={"time": base["time"]})
 
     return feat
 
