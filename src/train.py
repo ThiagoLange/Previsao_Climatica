@@ -193,7 +193,9 @@ def search_blend_alpha_by_month(
             rmse = root_mean_squared_error(y_m, alpha * pred_m + (1 - alpha) * clima_m)
             if rmse < best_rmse:
                 best_alpha, best_rmse = alpha, rmse
-        alphas[month] = round(float(best_alpha), 2)
+        # ``months`` comes from a NumPy-backed pandas array, so ``month`` can
+        # be a ``numpy.int64``. JSON only accepts native Python scalar keys.
+        alphas[int(month)] = round(float(best_alpha), 2)
         print(f"  month={month:02d} alpha={best_alpha:.2f} RMSE={best_rmse:.4f}")
 
     blended = apply_month_alpha(df_val, pred_val, alphas, default_alpha)
